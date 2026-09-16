@@ -1,0 +1,125 @@
+name: Watch AmneziaWG 3.x releases
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * *"
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM_REPO: amnezia-vpn/amneziawg-go
+  STATE_FILE: .last-version
+
+jobs:
+  check-upstream:
+    name: Check stable AWG 3.x upstream
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Detect latest stable AWG 3.x tag
+        id: check
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          CURRENT="$(cat "$STATE_FILE" 2>/dev/null || true)"
+
+          TAGS="$(gh api --paginate "repos/${UPSTREAM_REPO}/tags?per_page=100" --jq '.[].name')"
+          LATEST="$(printf '%s\n' "$TAGS" | grep -E '^v3\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1)"
+
+          if [ -z "$LATEST" ]; then
+            echo "No stable AWG 3.x tag found"
+            exit 1
+          fi
+
+          DOCKER_TAG="${LATEST#v}"
+          DOCKER_IMAGE="amneziavpn/amneziawg-go:${DOCKER_TAG}"
+
+          if ! docker manifest inspect "$DOCKER_IMAGE" >/dev/null 2>&1; then
+            echo "Latest Git tag is $LATEST, but Docker image $DOCKER_IMAGE is not available yet."
+            echo "latest=$LATEST" >> "$GITHUB_OUTPUT"
+            echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
+            echo "docker_image=$DOCKER_IMAGE" >> "$GITHUB_OUTPUT"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "docker_ready=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          CHANGED=false
+          if [ -z "$CURRENT" ] || [ "$LATEST" != "$CURRENT" ]; then
+            if [ -n "$CURRENT" ]; then
+              NEWEST="$(printf '%s\n%s\n' "$CURRENT" "$LATEST" | sort -V | tail -n 1)"
+              if [ "$NEWEST" = "$LATEST" ]; then
+                CHANGED=true
+              fi
+            else
+              CHANGED=true
+            fi
+          fi
+
+          echo "latest=$LATEST" >> "$GITHUB_OUTPUT"
+          echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
+          echo "docker_image=$DOCKER_IMAGE" >> "$GITHUB_OUTPUT"
+          echo "changed=$CHANGED" >> "$GITHUB_OUTPUT"
+          echo "docker_ready=true" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### AmneziaWG 3.x watcher"
+            echo
+            echo "- Previous baseline: ${CURRENT:-not set}"
+            echo "- Latest stable tag: $LATEST"
+            echo "- Docker image: $DOCKER_IMAGE"
+            echo "- Docker image available: yes"
+            echo "- New stable version detected: $CHANGED"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Save new baseline
+        if: steps.check.outputs.changed == 'true' && steps.check.outputs.docker_ready == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          printf '%s\n' "${{ steps.check.outputs.latest }}" > "$STATE_FILE"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$STATE_FILE"
+
+          if ! git diff --cached --quiet; then
+            git commit -m "Record upstream AWG3 ${{ steps.check.outputs.latest }}"
+            git push
+          fi
+
+      - name: Create release notification
+        if: steps.check.outputs.changed == 'true' && steps.check.outputs.docker_ready == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          LATEST="${{ steps.check.outputs.latest }}"
+          PREVIOUS="${{ steps.check.outputs.current }}"
+          DOCKER_IMAGE="${{ steps.check.outputs.docker_image }}"
+          RELEASE_TAG="awg3-${LATEST}"
+
+          gh release create "$RELEASE_TAG" \
+            --target main \
+            --title "Новая версия AmneziaWG — $LATEST" \
+            --notes "Обнаружена новая стабильная версия AmneziaWG 3.x.
+
+          Предыдущая зафиксированная версия watcher: ${PREVIOUS:-не задана}
+          Новая версия: $LATEST
+          Официальный Docker image: $DOCKER_IMAGE
+          Upstream tag: https://github.com/${UPSTREAM_REPO}/releases/tag/$LATEST
+
+          ВАЖНО: VPS автоматически не обновляется.
+          /opt/amnezia3 нужно обновлять только вручную после проверки changelog/issues и тестирования новой версии.
+          Старый /opt/amnezia (AWG2) этот watcher не затрагивает."
